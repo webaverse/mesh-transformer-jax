@@ -33,11 +33,13 @@ with jax.experimental.maps.mesh(devices, ('dp', 'mp')):
 
     c = CausalTransformer(dim=128, heads=8, layer_count=6, vocab=256, optimizer=opt)
 
-    print(f"Total parameters: {hk.data_structures.tree_size(c.state)}")
+    print(f"Total parameters: {hk.data_structures.tree_size(c.tpu_state['params'])}")
 
     for i in range(10):
         sample = loader.get_samples()
         loss = c.train(sample)
+
+        c.update(1)
 
         print(loss.mean())
 

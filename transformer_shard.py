@@ -1,3 +1,4 @@
+import functools
 import haiku as hk
 import jax
 import jax.numpy as jnp
@@ -158,15 +159,6 @@ class CausalTransformer:
     def __init__(self, dim: int, heads: int, layer_count: int, vocab: int, optimizer):
         self.heads = heads
 
-        def eval(state, ctx, tgt):
-            def eval_loss(x, y):
-                transformer = CausalTransformerShard(dim, heads, layer_count, vocab)
-                return transformer.eval(x, y)
-
-            eval_loss_fn = hk.without_apply_rng(hk.transform(eval_loss)).apply(ctx, tgt)
-
-            return eval_loss_fn(to_bf16(state["params"]), ctx, tgt)
-
         def train(state, ctx, tgt):
             def train_loss(x, y):
                 transformer = CausalTransformerShard(dim, heads, layer_count, vocab)
@@ -177,12 +169,10 @@ class CausalTransformer:
             value, grad = jax.value_and_grad(train_loss_fn)(to_bf16(state["params"]), ctx, tgt)
             grad = jax.lax.pmean(grad, "batch")
 
-            updates, new_opt_state = optimizer.update(grad, state["opt_state"])
-
             return value, {
-                "params": optax.apply_updates(state["params"], to_f32(updates)),
+                "params": state["params"],
                 "step": state["step"] + 1,
-                "opt_state": new_opt_state
+                "grad": jax.tree_multimap(lambda a, b: a+b, state["grad"], grad),
             }
 
         def init(key, x):
@@ -195,22 +185,22 @@ class CausalTransformer:
             params = param_init_fn(key, x, x)
 
             return {
-                "params": to_f32(params),
+                "params": params,
                 "step": np.array(0),
-                "opt_state": optimizer.init(params)
+                "grad": jax.tree_map(lambda a: jnp.zeros_like(a), params),
+            }
+
+        def set_tpu_state(new_params, old_state):
+            return {
+                "params": to_bf16(new_params),
+                "step": old_state["step"],
+                "grad": jax.tree_map(lambda a: jnp.zeros_like(a), old_state["grad"]),
             }
 
         self.init_xmap = jax.experimental.maps.xmap(fun=init,
                                                     in_axes=(["shard", ...],
                                                              ["batch", ...]),
                                                     out_axes=["shard", ...],
-                                                    axis_resources={'shard': 'mp', 'batch': 'dp'})
-
-        self.eval_xmap = jax.experimental.maps.xmap(fun=eval,
-                                                    in_axes=(["shard", ...],
-                                                             ["batch", ...],
-                                                             ["batch", ...]),
-                                                    out_axes=["batch", ...],
                                                     axis_resources={'shard': 'mp', 'batch': 'dp'})
 
         self.train_xmap = jax.experimental.maps.xmap(fun=train,
@@ -221,14 +211,50 @@ class CausalTransformer:
                                                      donate_argnums=(0,),
                                                      axis_resources={'shard': 'mp', 'batch': 'dp'})
 
+        self.set_xmap = jax.experimental.maps.xmap(fun=set_tpu_state,
+                                                     in_axes=(["shard", ...],
+                                                              ["shard", ...]),
+                                                     out_axes=["shard", ...],
+                                                     donate_argnums=(1,),
+                                                     axis_resources={'shard': 'mp'})
+
         key = hk.PRNGSequence(42)
 
         dp = thread_resources.env.shape['dp']
         mp = thread_resources.env.shape['mp']
         x = jax.random.uniform(next(key), (dp, 64,), minval=0, maxval=vocab).astype(jnp.int32)  # batch, len
 
-        self.state = self.init_xmap(jnp.array(key.take(mp)), x)
+        self.optimizer = optimizer
+
+        self.tpu_state = self.init_xmap(jnp.array(key.take(mp)), x)
+
+        cpu_device = jax.devices()[0]
+
+        @functools.partial(jax.jit, backend="cpu")
+        def cpu_init_jit(tpu_state):
+            fp32_params = jax.device_put(to_f32(self.tpu_state["params"]), cpu_device)
+            return {
+                        "opt_state": optimizer.init(fp32_params),
+                        "params": fp32_params
+                    }
+
+        self.cpu_state = cpu_init_jit(self.tpu_state)
 
     def train(self, sample):
-        loss, self.state = self.train_xmap(self.state, sample["obs"], sample["target"])
+        loss, self.tpu_state = self.train_xmap(self.tpu_state, sample["obs"], sample["target"])
         return np.array(loss)
+
+    def update(self, grad_acc_no):
+        @functools.partial(jax.jit, backend="cpu")
+        def cpu_update_jit(cpu_state, tpu_state, grad_acc_no):
+            grad = self.tpu_state["grad"] 
+            grad = jax.tree_map(lambda a: a / grad_acc_no, grad)
+            updates, new_opt_state = self.optimizer.update(grad, cpu_state["opt_state"])
+            
+            return {
+                "opt_state": new_opt_state,
+                "params": optax.apply_updates(cpu_state["params"], updates)
+            }
+
+        self.cpu_state = cpu_update_jit(self.cpu_state, self.tpu_state, grad_acc_no)
+        self.tpu_state = self.set_xmap(self.cpu_state["params"], self.tpu_state)

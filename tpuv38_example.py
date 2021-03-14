@@ -39,7 +39,7 @@ with jax.experimental.maps.mesh(devices, ('dp', 'mp')):
     # 10B
     c = CausalTransformer(dim=5120, heads=40, layer_count=32, vocab=256, optimizer=opt)
 
-    param_count = hk.data_structures.tree_size(c.state['params'])
+    param_count = hk.data_structures.tree_size(c.tpu_state['params'])
 
     print(f"Initialized in {time.time() - start:.06}s")
     print(f"Total parameters: {param_count}")
@@ -47,15 +47,23 @@ with jax.experimental.maps.mesh(devices, ('dp', 'mp')):
     start = time.time()
     sample = loader.get_samples()
     loss = c.train(sample)
-    print(f"Compiled in {time.time() - start:.06}s")
+    print(f"Train step compiled in {time.time() - start:.06}s")
+
+    start = time.time()
+    c.update(1)
+    print(f"Update step compiled in {time.time() - start:.06}s")
 
     start = time.time()
     for i in range(it):
         with jax.profiler.StepTraceContext("train", step_num=i):
             sample = loader.get_samples()
             loss = c.train(sample)
-            if i % 10 == 0:
-                print(f"it: {i}, loss: {loss.mean()}")
+            print(f"it: {i}, loss: {loss.mean()}")
+
+            if i in range(10):
+                start = time.time()
+                c.update(10)
+                print(f"Update step done in {time.time() - start:.06}s")
     total_time = time.time() - start
     print(f"{it} steps in {total_time:.06}s")
 
